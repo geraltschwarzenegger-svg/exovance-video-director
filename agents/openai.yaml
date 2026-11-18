@@ -3,8 +3,8 @@ interface:
   short_description: Эдиты под музыку, эффекты и фирменный Exovance
   default_prompt: 'Используй $exovance-video-director: собери готовый эдит из моих
     материалов под музыку; уточни недостающие время и место водяного знака.'
-  icon_small: assets/icon.svg
-  icon_large: assets/icon.svg
+  icon_small: assets/icon.png
+  icon_large: assets/icon.png
 policy:
   products:
   - chatgpt
