@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render one timed translucent signature; use a preview before material crops."""
+"""Render one timed translucent signature, with optional movement and a soft glint."""
 import argparse, json, math, subprocess, tempfile
 from pathlib import Path
 
@@ -33,6 +33,8 @@ def main():
     parser.add_argument('--fade', type=float, default=0)
     parser.add_argument('--end', type=float)
     parser.add_argument('--fade-out', type=float, default=.4)
+    parser.add_argument('--effect', choices=['none', 'soft-glint'], default='none',
+                        help='Optional small upward motion and one brief highlight as the title appears.')
     parser.add_argument('--opacity', type=float, default=.34)
     parser.add_argument('--font-size', type=int)
     parser.add_argument('--font', type=Path)
@@ -63,7 +65,13 @@ def main():
     if video is None:
         parser.error('Source has no video stream.')
     width, height = video['width'], video['height']
-    duration = float(data.get('format', {}).get('duration') or video.get('duration') or 0)
+    rotation = next(
+        (entry['rotation'] for entry in video.get('side_data_list', []) if 'rotation' in entry),
+        0,
+    )
+    if rotation % 180 == 90:
+        width, height = height, width
+    duration = float(video.get('duration') or data.get('format', {}).get('duration') or 0)
     if duration and args.start >= duration:
         parser.error('Appearance begins after the video ends.')
     if args.preview_at is not None and (args.preview_at < 0 or duration and args.preview_at >= duration):
@@ -108,26 +116,59 @@ def main():
     if args.end is not None:
         tail = smooth(f'({args.end}-t)/{args.fade_out}') if args.fade_out else f'lt(t,{args.end})'
         alpha = f'({alpha})*({tail})'
+    if args.effect == 'soft-glint':
+        motion_duration = args.fade or 0.55
+        available = args.end if args.end is not None else duration
+        if available:
+            motion_duration = min(motion_duration, available - args.start)
+        progress = f'(t-{args.start})/{motion_duration}'
+        shift = max(1, round(min(out_h * 0.01, font_size * 0.4)))
+        ypos = f'min(h-th,({ypos})+{shift}*(1-({smooth(progress)})))'
+        brighten = smooth(f'(({progress})-0.4)/0.4')
+        soften = smooth(f'(1.6-({progress}))/0.8')
+        glint_alpha = f'({alpha})*({brighten})*({soften})'
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='exovance-title-') as private:
+    with (
+        tempfile.TemporaryDirectory(prefix='exovance-title-') as private,
+        tempfile.TemporaryDirectory(prefix='.exovance-render-', dir=output.parent) as staging,
+    ):
         textfile = Path(private)/'title.txt'
+        render = Path(staging) / output.name
         textfile.write_text(args.text, encoding='utf-8')
-        filters.append(f"drawtext=fontfile='{filter_path(font)}':textfile='{filter_path(textfile)}':expansion=none:fontsize={font_size}:fontcolor=0xb4bfc8@{args.opacity}:shadowcolor=black@0.10:shadowx=1:shadowy=1:x={xpos}:y={ypos}:alpha='{alpha}'")
+        drawtext = (
+            f"drawtext=fontfile='{filter_path(font)}':textfile='{filter_path(textfile)}'"
+            f":expansion=none:fontsize={font_size}:x={xpos}:y='{ypos}'"
+        )
+        filters.append(
+            f"{drawtext}:fontcolor=0xb4bfc8@{args.opacity}"
+            f":shadowcolor=black@0.10:shadowx=1:shadowy=1:alpha='{alpha}'"
+        )
+        if args.effect == 'soft-glint':
+            highlight_opacity = args.opacity * 0.45
+            filters.append(
+                f"{drawtext}:fontcolor=0xf3fbff@{highlight_opacity}:alpha='{glint_alpha}'"
+            )
         command = ['ffmpeg', '-v', 'error', '-y', '-i', str(source)]
         if args.preview_at is not None:
             if output.suffix.lower() not in ['.png', '.jpg', '.jpeg']:
                 parser.error('Use a PNG/JPEG output for --preview-at.')
             filters.append(f"select='gte(t,{args.preview_at})'")
-            command += ['-vf', ','.join(filters), '-map', '0:v:0', '-an', '-frames:v', '1', str(output)]
+            command += ['-vf', ','.join(filters), '-map', '0:v:0', '-an', '-frames:v', '1', str(render)]
         else:
             audio = next((s for s in data['streams'] if s['codec_type'] == 'audio'), None)
             command += ['-vf', ','.join(filters), '-map', '0:v:0', '-map', '0:a:0?', '-c:v', 'libx264', '-threads', '4', '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv420p']
             command += ['-c:a', 'copy'] if not audio or audio['codec_name'] == 'aac' else ['-c:a', 'aac', '-b:a', '192k']
-            command += ['-movflags', '+faststart', str(output)]
+            command += ['-movflags', '+faststart', str(render)]
         run(command)
+        if not render.is_file() or render.stat().st_size == 0:
+            parser.error('No output frame was rendered at that timestamp.')
+        if output.exists() and not args.overwrite:
+            parser.error('Output was created while rendering; choose a new output path.')
+        render.replace(output)
     result = {'output':str(output), 'bytes':output.stat().st_size, 'watermarks':1,
               'start':args.start, 'fade':args.fade, 'end':args.end, 'opacity':args.opacity,
-              'crop':[cropped_w,cropped_h], 'output_size':[out_w,out_h], 'position':args.position}
+              'crop':[cropped_w,cropped_h], 'output_size':[out_w,out_h], 'position':args.position,
+              'effect':args.effect}
     print(json.dumps(result, ensure_ascii=False))
 
 

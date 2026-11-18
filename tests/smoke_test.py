@@ -29,14 +29,18 @@ def run_script(script, *args):
     return run(sys.executable, ROOT / "scripts" / script, *args)
 
 
-def bottom_peak(path, timestamp):
+def frame_luminance(path, timestamp):
     frame = run(
         "ffmpeg", "-v", "error", "-ss", timestamp, "-i", path,
         "-frames:v", "1", "-c:v", "png", "-f", "image2pipe", "-",
     )
     with Image.open(io.BytesIO(frame)) as image:
-        region = image.crop((WIDTH // 3, HEIGHT - 65, 2 * WIDTH // 3, HEIGHT))
-        return region.convert("L").getextrema()[1]
+        return image.convert("L")
+
+
+def bottom_peak(path, timestamp):
+    frame = frame_luminance(path, timestamp)
+    return frame.crop((WIDTH // 3, HEIGHT - 65, 2 * WIDTH // 3, HEIGHT)).getextrema()[1]
 
 
 class VideoSmokeTest(unittest.TestCase):
@@ -71,6 +75,17 @@ class VideoSmokeTest(unittest.TestCase):
                 self.assertIn("ZAPPER", words)
                 self.assertLess(words["ZAPPER"]["left"], 50)
                 self.assertLess(words["ZAPPER"]["top"], 65)
+
+            detail_dir = work / "detail"
+            run_script(
+                "media_audit.py", source, "--out-dir", detail_dir, "--frames", "3",
+                "--frames-from", "0.8", "--frames-to", "1.2", "--ocr",
+            )
+            detail = json.loads((detail_dir / "audit.json").read_text())
+            for sample, expected in zip(detail["ocr_samples"], (0.8, 1.0, 1.2), strict=True):
+                self.assertAlmostEqual(sample["sample_time_seconds"], expected)
+                self.assertIn("ZAPPER", {word["text"] for word in sample["words"]})
+
             run_script(
                 "watermark_export.py", source, output, "--start", "1",
                 "--fade", "0.8", "--position", "bottom-center", "--font", FONT,
@@ -100,6 +115,40 @@ class VideoSmokeTest(unittest.TestCase):
                 "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-",
             )
             self.assertEqual(hashlib.sha256(source.read_bytes()).digest(), source_digest)
+
+    def test_soft_glint_and_metadata_rotation(self):
+        with TemporaryDirectory(prefix="exovance-portrait-") as directory:
+            work = Path(directory)
+            source = work / "landscape.mp4"
+            portrait = work / "rotated.mp4"
+            output = work / "effect.mp4"
+            run(
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                f"color=black:size={WIDTH}x{HEIGHT}:rate=24:d=2.5",
+                "-c:v", "libx264", source,
+            )
+            run(
+                "ffmpeg", "-v", "error", "-display_rotation:v:0", "90",
+                "-i", source, "-c", "copy", portrait,
+            )
+            render = json.loads(run_script(
+                "watermark_export.py", portrait, output, "--start", "0.5",
+                "--fade", "0.8", "--position", "bottom-center", "--font", FONT,
+                "--font-size", "24", "--effect", "soft-glint", "--crop-bottom", "20",
+            ))
+            self.assertEqual(render["output_size"], [HEIGHT, WIDTH])
+            before, rising, glint, settled = (
+                frame_luminance(output, time) for time in ("0.3", "0.82", "1.2", "2")
+            )
+            self.assertEqual(settled.size, (HEIGHT, WIDTH))
+            self.assertLessEqual(before.getextrema()[1], 3)
+            self.assertGreater(glint.getextrema()[1], settled.getextrema()[1] + 8)
+            rising_box = rising.point(lambda pixel: 255 if pixel > 15 else 0).getbbox()
+            settled_box = settled.point(lambda pixel: 255 if pixel > 15 else 0).getbbox()
+            self.assertIsNotNone(rising_box)
+            self.assertIsNotNone(settled_box)
+            self.assertGreater(rising_box[1], settled_box[1])
+            self.assertGreater(settled_box[1], WIDTH - 65)
 
 
 if __name__ == "__main__":

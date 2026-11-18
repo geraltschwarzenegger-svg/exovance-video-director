@@ -81,6 +81,8 @@ def main():
     p.add_argument('source',type=Path)
     p.add_argument('--out-dir',type=Path,required=True)
     p.add_argument('--frames',type=int,default=10)
+    p.add_argument('--frames-from', type=float, default=0, help='First timestamp to sample, in source seconds.')
+    p.add_argument('--frames-to', type=float, help='Last timestamp to sample, in source seconds.')
     p.add_argument('--ocr', action='store_true', help='Scan sampled video frames with local Tesseract.')
     p.add_argument('--ocr-language', help='Installed Tesseract language(s), for example eng or eng+rus.')
     p.add_argument('--audio-onsets',action='store_true')
@@ -88,6 +90,12 @@ def main():
     args=p.parse_args();source=args.source.resolve();out=args.out_dir.resolve()
     if not source.is_file() or not 1 <= args.frames <= 30:
         p.error('Use an existing source and 1–30 stills.')
+    if not math.isfinite(args.frames_from) or args.frames_from < 0:
+        p.error('--frames-from must be a finite, non-negative timestamp.')
+    if args.frames_to is not None and (
+        not math.isfinite(args.frames_to) or args.frames_to <= args.frames_from
+    ):
+        p.error('--frames-to must be finite and later than --frames-from.')
     if args.ocr_language and not args.ocr:
         p.error('--ocr-language requires --ocr.')
     if args.ocr and not shutil.which('tesseract'):
@@ -97,26 +105,41 @@ def main():
     duration=float(meta.get('format',{}).get('duration') or 0)
     result={'source':str(source),'duration_seconds':duration,'streams':meta.get('streams',[])}
     video=next((s for s in meta.get('streams',[]) if s['codec_type']=='video'),None)
-    if args.ocr and (not video or duration <= 0):
-        p.error('--ocr requires a video with a known duration.')
+    if (args.ocr or args.frames_from or args.frames_to is not None) and (not video or duration <= 0):
+        p.error('OCR or a frame range requires a video with a known duration.')
     if video and duration>0:
         from PIL import Image,ImageDraw
         video_duration = float(video.get('duration') or duration)
+        first_sample = args.frames_from
+        if first_sample >= video_duration:
+            p.error('--frames-from must be before the video ends.')
         try:
             frame_rate = Fraction(video.get('avg_frame_rate') or '0')
         except (ValueError, ZeroDivisionError):
             frame_rate = Fraction(0)
         frame_interval = float(1 / frame_rate) if frame_rate > 0 else 0.05
         # Container duration can include audio beyond the final video frame.
-        last_sample = max(0, min(video_duration * 0.98, video_duration - frame_interval))
-        times = [last_sample * i / (args.frames - 1) for i in range(args.frames)] if args.frames > 1 else [last_sample / 2]
+        safe_end = (
+            max(0, video_duration - frame_interval)
+            if args.frames_to is not None
+            else max(0, min(video_duration * 0.98, video_duration - frame_interval))
+        )
+        last_sample = max(first_sample, min(safe_end, args.frames_to or video_duration))
+        if args.frames == 1:
+            times = [(first_sample + last_sample) / 2]
+        else:
+            span = last_sample - first_sample
+            times = [first_sample + span * i / (args.frames - 1) for i in range(args.frames)]
         images=[]
         actual_times = []
         ocr_samples = []
         frame_filter = [] if args.ocr else ['-vf', 'scale=320:-2']
         for i, requested_time in enumerate(times):
             # The estimated frame interval may fall between uneven timestamps.
-            for t in (requested_time, max(0, requested_time - max(0.15, frame_interval)), 0):
+            for t in dict.fromkeys((
+                requested_time, max(first_sample, requested_time - max(0.15, frame_interval)),
+                first_sample,
+            )):
                 raw = run([
                     'ffmpeg', '-v', 'error', '-ss', str(t), '-i', str(source),
                     '-frames:v', '1', *frame_filter, '-f', 'image2pipe', '-vcodec', 'png', '-',
