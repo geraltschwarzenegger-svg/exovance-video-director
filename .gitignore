@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 /work/
 /exports/
+/graphify-out/
 *.mp4
 *.mov
 *.mkv
