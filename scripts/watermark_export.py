@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
 """Render one timed translucent signature, with optional movement and a soft glint."""
-import argparse, json, math, subprocess, tempfile
+import argparse, json, math, tempfile
 from pathlib import Path
 
-
-def run(command):
-    result = subprocess.run(command, capture_output=True)
-    if result.returncode:
-        raise RuntimeError(result.stderr.decode(errors='replace')[-5000:])
-    return result.stdout
-
-
-def probe(path):
-    return json.loads(run(['ffprobe', '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(path)]))
+from verify_export import (
+    duration_seconds, frame_rate, probe, rotation_degrees, run, verify_export, video_streams,
+)
 
 
 def smooth(expression):
@@ -61,17 +54,17 @@ def main():
     if not 0 <= args.opacity <= 1 or args.end is not None and args.end <= args.start:
         parser.error('Invalid opacity or end time.')
     data = probe(source)
-    video = next((s for s in data['streams'] if s['codec_type'] == 'video'), None)
-    if video is None:
+    videos = video_streams(data)
+    if not videos:
         parser.error('Source has no video stream.')
+    video = videos[0]
+    audio = next((s for s in data['streams'] if s['codec_type'] == 'audio'), None)
     width, height = video['width'], video['height']
-    rotation = next(
-        (entry['rotation'] for entry in video.get('side_data_list', []) if 'rotation' in entry),
-        0,
-    )
-    if rotation % 180 == 90:
+    if rotation_degrees(video) % 180 == 90:
         width, height = height, width
-    duration = float(video.get('duration') or data.get('format', {}).get('duration') or 0)
+    video_duration = duration_seconds(video.get('duration'))
+    source_duration = duration_seconds(data['format'].get('duration'))
+    duration = video_duration or source_duration or 0
     if duration and args.start >= duration:
         parser.error('Appearance begins after the video ends.')
     if args.preview_at is not None and (args.preview_at < 0 or duration and args.preview_at >= duration):
@@ -128,6 +121,7 @@ def main():
         soften = smooth(f'(1.6-({progress}))/0.8')
         glint_alpha = f'({alpha})*({brighten})*({soften})'
     output.parent.mkdir(parents=True, exist_ok=True)
+    verification = None
     with (
         tempfile.TemporaryDirectory(prefix='exovance-title-') as private,
         tempfile.TemporaryDirectory(prefix='.exovance-render-', dir=output.parent) as staging,
@@ -149,19 +143,36 @@ def main():
                 f"{drawtext}:fontcolor=0xf3fbff@{highlight_opacity}:alpha='{glint_alpha}'"
             )
         command = ['ffmpeg', '-v', 'error', '-y', '-i', str(source)]
+        video_map = f"0:{video['index']}"
         if args.preview_at is not None:
             if output.suffix.lower() not in ['.png', '.jpg', '.jpeg']:
                 parser.error('Use a PNG/JPEG output for --preview-at.')
             filters.append(f"select='gte(t,{args.preview_at})'")
-            command += ['-vf', ','.join(filters), '-map', '0:v:0', '-an', '-frames:v', '1', str(render)]
+            command += ['-vf', ','.join(filters), '-map', video_map, '-an', '-frames:v', '1', str(render)]
         else:
-            audio = next((s for s in data['streams'] if s['codec_type'] == 'audio'), None)
-            command += ['-vf', ','.join(filters), '-map', '0:v:0', '-map', '0:a:0?', '-c:v', 'libx264', '-threads', '4', '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv420p']
+            command += ['-vf', ','.join(filters), '-map', video_map, '-map', '0:a:0?', '-c:v', 'libx264', '-threads', '4', '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv420p']
             command += ['-c:a', 'copy'] if not audio or audio['codec_name'] == 'aac' else ['-c:a', 'aac', '-b:a', '192k']
             command += ['-movflags', '+faststart', str(render)]
         run(command)
         if not render.is_file() or render.stat().st_size == 0:
-            parser.error('No output frame was rendered at that timestamp.')
+            parser.error('Render did not produce an output file.')
+        if args.preview_at is None and output.suffix.lower() == '.mp4':
+            # With no --fps, a variable-rate source has no single target FPS.
+            average_fps = frame_rate(video.get('avg_frame_rate'))
+            expected_fps = args.fps
+            if expected_fps is None and average_fps == frame_rate(video.get('r_frame_rate')):
+                expected_fps = average_fps
+            # The input container duration may include unmapped tracks.
+            expected_duration = None
+            if len(data['streams']) == (1 if audio is None else 2):
+                expected_duration = source_duration
+            try:
+                verification = verify_export(
+                    render, size=(out_w, out_h), fps=expected_fps, duration=expected_duration,
+                    audio_required=audio is not None, video_duration=video_duration,
+                )
+            except (RuntimeError, ValueError, OSError) as error:
+                parser.exit(1, f'MP4 verification failed: {error}\n')
         if output.exists() and not args.overwrite:
             parser.error('Output was created while rendering; choose a new output path.')
         render.replace(output)
@@ -169,6 +180,8 @@ def main():
               'start':args.start, 'fade':args.fade, 'end':args.end, 'opacity':args.opacity,
               'crop':[cropped_w,cropped_h], 'output_size':[out_w,out_h], 'position':args.position,
               'effect':args.effect}
+    if verification is not None:
+        result['verification'] = verification
     print(json.dumps(result, ensure_ascii=False))
 
 

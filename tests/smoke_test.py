@@ -86,11 +86,22 @@ class VideoSmokeTest(unittest.TestCase):
                 self.assertAlmostEqual(sample["sample_time_seconds"], expected)
                 self.assertIn("ZAPPER", {word["text"] for word in sample["words"]})
 
-            run_script(
+            export = json.loads(run_script(
                 "watermark_export.py", source, output, "--start", "1",
                 "--fade", "0.8", "--position", "bottom-center", "--font", FONT,
                 "--opacity", "0.35", "--fps", "60",
-            )
+            ))
+            self.assertEqual(export["verification"], {
+                "size": [WIDTH, HEIGHT],
+                "rotation_degrees": 0,
+                "fps": "60",
+                "video_codec": "h264",
+                "pixel_format": "yuv420p",
+                "duration_seconds": 3,
+                "video_duration_seconds": 3,
+                "audio_codecs": ["aac"],
+                "decoded": True,
+            })
 
             meta = json.loads(run(
                 "ffprobe", "-v", "error", "-show_streams", "-show_format",
@@ -137,6 +148,9 @@ class VideoSmokeTest(unittest.TestCase):
                 "--font-size", "24", "--effect", "soft-glint", "--crop-bottom", "20",
             ))
             self.assertEqual(render["output_size"], [HEIGHT, WIDTH])
+            self.assertEqual(render["verification"]["size"], [HEIGHT, WIDTH])
+            self.assertEqual(render["verification"]["audio_codecs"], [])
+            self.assertTrue(render["verification"]["decoded"])
             before, rising, glint, settled = (
                 frame_luminance(output, time) for time in ("0.3", "0.82", "1.2", "2")
             )
@@ -149,6 +163,45 @@ class VideoSmokeTest(unittest.TestCase):
             self.assertIsNotNone(settled_box)
             self.assertGreater(rising_box[1], settled_box[1])
             self.assertGreater(settled_box[1], WIDTH - 65)
+
+    def test_verify_export_rejects_mismatches_and_truncated_media(self):
+        with TemporaryDirectory(prefix="exovance-verify-") as directory:
+            work = Path(directory)
+            valid = work / "valid.mp4"
+            run(
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=128x72:rate=24:d=2",
+                "-c:v", "libx264", "-g", "12", "-movflags", "+faststart", valid,
+            )
+            expected = ("--size", "128", "72", "--fps", "24", "--duration", "2", "--audio", "absent")
+            report = json.loads(run_script("verify_export.py", valid, *expected))
+            self.assertEqual(report["fps"], "24")
+            self.assertTrue(report["decoded"])
+
+            def verify_failure(file, *options):
+                result = subprocess.run(
+                    [sys.executable, ROOT / "scripts" / "verify_export.py", file, *options],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, "")
+                return result.stderr
+
+            errors = verify_failure(
+                valid, "--size", "1920", "1080", "--fps", "60", "--duration", "3",
+                "--audio", "required", "--video-codec", "hevc",
+            )
+            for message in ("Resolution:", "FPS:", "Video codec:", "MP4 duration:", "Expected audio"):
+                self.assertIn(message, errors)
+
+            truncated = work / "truncated.mp4"
+            data = valid.read_bytes()
+            truncated.write_bytes(data[:len(data) * 3 // 4])
+            # Faststart keeps the declared metadata readable even though late packets are missing.
+            self.assertEqual(run(
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "csv=p=0", truncated,
+            ).strip(), b"2.000000")
+            self.assertIn("Decoding failed:", verify_failure(truncated, *expected))
 
 
 if __name__ == "__main__":
