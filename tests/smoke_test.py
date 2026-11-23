@@ -8,6 +8,7 @@ import sys
 from tempfile import TemporaryDirectory
 import unittest
 
+import numpy as np
 from PIL import Image
 
 
@@ -41,6 +42,13 @@ def frame_luminance(path, timestamp):
 def bottom_peak(path, timestamp):
     frame = frame_luminance(path, timestamp)
     return frame.crop((WIDTH // 3, HEIGHT - 65, 2 * WIDTH // 3, HEIGHT)).getextrema()[1]
+
+
+def rgb_frame(path, timestamp):
+    return run(
+        "ffmpeg", "-v", "error", "-ss", timestamp, "-i", path, "-frames:v", "1",
+        "-pix_fmt", "rgb24", "-f", "rawvideo", "-",
+    )
 
 
 class VideoSmokeTest(unittest.TestCase):
@@ -202,6 +210,97 @@ class VideoSmokeTest(unittest.TestCase):
                 "-of", "csv=p=0", truncated,
             ).strip(), b"2.000000")
             self.assertIn("Decoding failed:", verify_failure(truncated, *expected))
+
+    def test_text_replacement_preserves_clean_details_and_aac(self):
+        with TemporaryDirectory(prefix="exovance-text-") as directory:
+            work = Path(directory)
+            plate, marked = work / "clean.png", work / "marked.png"
+            title, mask = work / "title.png", work / "mask.png"
+            source, master, delivery = work / "source.mkv", work / "master.mkv", work / "delivery.mp4"
+            width, height = 192, 108
+            rng = np.random.default_rng(42)
+            background = rng.integers(16, 200, (height, width, 3), dtype=np.uint8)
+            Image.fromarray(background).save(plate)
+            damaged = background.copy()
+            damaged[35:57, 55:59] = 255
+            damaged[48:52, 48:69] = 255
+            Image.fromarray(damaged).save(marked)
+            run(
+                "ffmpeg", "-v", "error", "-loop", "1", "-framerate", "12", "-i", marked,
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:d=1",
+                "-t", "1", "-c:v", "ffv1", "-pix_fmt", "bgr0", "-c:a", "aac", source,
+            )
+            run_script(
+                "replace_text.py", "mask", marked, plate, mask, "--roi", "35", "20", "90", "60",
+                "--threshold", "1", "--expand", "0",
+            )
+            with Image.open(mask) as image:
+                black_and_white = np.asarray(image)
+            np.testing.assert_array_equal(black_and_white == 255, np.any(damaged != background, axis=2))
+            run_script(
+                "replace_text.py", "title", title, "--size", width, height,
+                "--text", "НОВЫЙ", "--font", FONT, "--font-size", "22", "--position", "46", "35",
+            )
+            options = ("--clean-plate", plate, "--mask", mask, "--start", "0.15", "--end", "0.85")
+            preview = work / "restored.png"
+            run_script("replace_text.py", "render", source, preview, *options, "--preview-at", "0.5")
+            with Image.open(preview) as image:
+                np.testing.assert_array_equal(np.array(image), background)
+            run_script("replace_text.py", "render", source, master, *options, "--title-overlay", title)
+            outside = rgb_frame(master, "0.0")
+            self.assertEqual(outside, damaged.tobytes())
+            actual = np.frombuffer(rgb_frame(master, "0.5"), dtype=np.uint8).reshape((height, width, 3))
+            with Image.open(title) as image:
+                alpha = np.asarray(image.getchannel("A"))
+            np.testing.assert_array_equal(actual[alpha == 0], background[alpha == 0])
+            self.assertGreater(np.count_nonzero(actual[alpha == 255] != background[alpha == 255]), 10)
+            report = json.loads(run_script(
+                "replace_text.py", "render", source, delivery, *options, "--title-overlay", title,
+            ))
+            self.assertEqual(report["verification"]["size"], [width, height])
+            self.assertEqual(report["verification"]["fps"], "12")
+            self.assertTrue(report["verification"]["decoded"])
+            def audio_hash(path):
+                return run("ffmpeg", "-v", "error", "-i", path, "-map", "0:a", "-c", "copy", "-f", "hash", "-")
+            self.assertEqual(audio_hash(source), audio_hash(delivery))
+
+    def test_text_replacement_synchronizes_moving_layers(self):
+        with TemporaryDirectory(prefix="exovance-moving-text-") as directory:
+            work = Path(directory)
+            width, height = 96, 54
+            frames = []
+            for index in range(4):
+                clean = np.full((height, width, 3), (16 * index, 100, 163), dtype=np.uint8)
+                clean[8:24, 10 + index:29 + index] = (182, 136, 58)
+                marked = clean.copy()
+                marked[12:22, 14 + index:17 + index] = 255
+                mask = np.any(marked != clean, axis=2).astype(np.uint8) * 255
+                title = np.zeros((height, width, 4), dtype=np.uint8)
+                title[28:34, 30 + index:45 + index] = (13, 61, 242, 255)
+                for label, frame in (("plate", clean), ("source", marked), ("mask", mask), ("title", title)):
+                    Image.fromarray(frame).save(work / f"{label}{index}.png")
+                combined = clean.copy()
+                combined[28:34, 30 + index:45 + index] = (13, 61, 242)
+                frames.append(combined)
+            for label, pix_fmt in (("plate", "bgr0"), ("source", "bgr0"), ("mask", "gray"), ("title", "bgra")):
+                run("ffmpeg", "-v", "error", "-framerate", "4", "-i", work / f"{label}%d.png",
+                    "-c:v", "ffv1", "-pix_fmt", pix_fmt, work / f"{label}.mkv")
+            output = work / "restored.mkv"
+            run_script(
+                "replace_text.py", "render", work / "source.mkv", output,
+                "--clean-plate", work / "plate.mkv", "--mask", work / "mask.mkv",
+                "--title-overlay", work / "title.mkv",
+            )
+            for index, frame in enumerate(frames):
+                self.assertEqual(rgb_frame(output, str(index / 4)), frame.tobytes())
+
+            rejected = subprocess.run(
+                [sys.executable, ROOT / "scripts" / "replace_text.py", "render", work / "source.mkv",
+                 work / "rejected.mkv", "--clean-plate", work / "plate.mkv", "--mask", work / "mask.mkv",
+                 "--title-overlay", work / "plate.mkv"], capture_output=True, check=False,
+            )
+            self.assertIn(b"needs a video stream with alpha", rejected.stderr)
+            self.assertFalse((work / "rejected.mkv").exists())
 
 
 if __name__ == "__main__":
