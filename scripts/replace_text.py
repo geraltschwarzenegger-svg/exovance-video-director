@@ -9,6 +9,7 @@ import tempfile
 import numpy as np
 from PIL import Image, ImageColor, ImageDraw, ImageFilter, ImageFont
 
+from export_size import RESOLUTIONS, delivery_size
 from verify_export import duration_seconds, frame_rate, probe, rotation_degrees, run, verify_export, video_streams
 
 
@@ -214,8 +215,7 @@ def render(args):
         raise ValueError('The edit must lie inside the video timeline.')
     if args.preview_at is not None and not 0 <= args.preview_at < duration:
         raise ValueError('The preview time must lie inside the video timeline.')
-    if suffix == '.mp4' and any(dimension % 2 for dimension in size):
-        raise ValueError('H.264 yuv420p requires even dimensions. Use a lossless MKV master for this size.')
+    output_size = delivery_size(*size, args.resolution) if suffix == '.mp4' else size
     source_start = float(video.get('start_time') or 0) - float(metadata['format'].get('start_time') or 0)
     if any(path.suffix.lower() != '.png' for path in layers[1:]) and abs(source_start) > 0.0005:
         raise ValueError('Align the source and moving layers to the same zero video timestamp first.')
@@ -223,6 +223,10 @@ def render(args):
     indices.extend(inspect_layer(path, kind, size, video, duration, rate)
                    for path, kind in zip(layers[1:], ('plate', 'mask', 'title')))
     filters, output_label = filter_graph(indices, args.start, end)
+    if output_size != size:
+        width, height = output_size
+        filters += f';{output_label}scale={width}:{height}:flags=lanczos[delivery]'
+        output_label = '[delivery]'
     audio = [stream for stream in metadata['streams'] if stream['codec_type'] == 'audio']
     command = ['ffmpeg', '-nostdin', '-v', 'error', '-xerror', '-filter_complex_threads', '2']
     for path in layers:
@@ -243,12 +247,13 @@ def render(args):
     with tempfile.TemporaryDirectory(prefix='.exovance-replace-', dir=output.parent) as temp:
         staged = Path(temp) / output.name
         run([*command, str(staged)], fail_on_stderr=True)
-        report = {'output': str(output), 'size': list(size), 'start': args.start, 'end': end}
+        report = {'output': str(output), 'size': list(output_size), 'source_size': list(size),
+                  'start': args.start, 'end': end}
         if suffix == '.mp4':
             expected_fps = rate if rate == frame_rate(video.get('r_frame_rate')) else None
             expected_total = total_length if len(audio) + 1 == len(metadata['streams']) else None
             report['verification'] = verify_export(
-                staged, size=size, fps=expected_fps, duration=expected_total, video_duration=duration,
+                staged, size=output_size, fps=expected_fps, duration=expected_total, video_duration=duration,
                 audio_required=bool(audio),
             )
         finish(staged, output, args.overwrite)
@@ -290,6 +295,8 @@ def main():
     composite.add_argument('--start', type=float, default=0)
     composite.add_argument('--end', type=float)
     composite.add_argument('--preview-at', type=float)
+    composite.add_argument('--resolution', choices=RESOLUTIONS, default='1080p',
+                           help='Minimum MP4 resolution. PNG previews and MKV masters keep the source size.')
     composite.add_argument('--overwrite', action='store_true')
     composite.set_defaults(handler=render)
     args = parser.parse_args()

@@ -3,6 +3,7 @@
 import argparse, json, math, tempfile
 from pathlib import Path
 
+from export_size import RESOLUTIONS, delivery_size
 from verify_export import (
     duration_seconds, frame_rate, probe, rotation_degrees, run, verify_export, video_streams,
 )
@@ -39,6 +40,8 @@ def main():
     parser.add_argument('--crop-mode', choices=['preserve-aspect', 'wide'], default='preserve-aspect')
     parser.add_argument('--allow-large-crop', action='store_true')
     parser.add_argument('--preview-at', type=float)
+    parser.add_argument('--resolution', choices=RESOLUTIONS, default='1080p',
+                        help='Minimum MP4 resolution. Use source to keep the size or 4k for UHD.')
     parser.add_argument('--fps', type=int, help='Output frame rate, for example 60. Omit to retain the source cadence.')
     parser.add_argument('--overwrite', action='store_true')
     args = parser.parse_args()
@@ -82,12 +85,13 @@ def main():
         cropped_w = width if args.crop_mode == 'wide' else int(cropped_h*width/height)//2*2
         left = (width-cropped_w)//2
         filters.append(f'crop={cropped_w}:{cropped_h}:{left}:0')
-        if args.crop_mode == 'preserve-aspect':
-            filters.append(f'scale={width}:{height}:flags=lanczos')
+    out_w, out_h = (cropped_w, cropped_h) if args.crop_mode == 'wide' else (width, height)
+    if args.preview_at is None and output.suffix.lower() == '.mp4':
+        out_w, out_h = delivery_size(out_w, out_h, args.resolution)
+    if (out_w, out_h) != (cropped_w, cropped_h):
+        filters.append(f'scale={out_w}:{out_h}:flags=lanczos')
     if args.fps is not None:
         filters.append(f'fps={args.fps}')
-    out_w = width
-    out_h = cropped_h if args.crop_mode == 'wide' else height
     fonts = [args.font] if args.font else [
         Path('/usr/share/fonts/truetype/open-sans/OpenSans-BoldItalic.ttf'),
         Path('/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf')]
@@ -178,7 +182,8 @@ def main():
         render.replace(output)
     result = {'output':str(output), 'bytes':output.stat().st_size, 'watermarks':1,
               'start':args.start, 'fade':args.fade, 'end':args.end, 'opacity':args.opacity,
-              'crop':[cropped_w,cropped_h], 'output_size':[out_w,out_h], 'position':args.position,
+              'crop':[cropped_w,cropped_h], 'source_size':[width,height],
+              'output_size':[out_w,out_h], 'position':args.position,
               'effect':args.effect}
     if verification is not None:
         result['verification'] = verification

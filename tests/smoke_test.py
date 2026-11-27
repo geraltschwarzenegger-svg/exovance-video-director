@@ -97,7 +97,7 @@ class VideoSmokeTest(unittest.TestCase):
             export = json.loads(run_script(
                 "watermark_export.py", source, output, "--start", "1",
                 "--fade", "0.8", "--position", "bottom-center", "--font", FONT,
-                "--opacity", "0.35", "--fps", "60",
+                "--opacity", "0.35", "--fps", "60", "--resolution", "source",
             ))
             self.assertEqual(export["verification"], {
                 "size": [WIDTH, HEIGHT],
@@ -154,6 +154,7 @@ class VideoSmokeTest(unittest.TestCase):
                 "watermark_export.py", portrait, output, "--start", "0.5",
                 "--fade", "0.8", "--position", "bottom-center", "--font", FONT,
                 "--font-size", "24", "--effect", "soft-glint", "--crop-bottom", "20",
+                "--resolution", "source",
             ))
             self.assertEqual(render["output_size"], [HEIGHT, WIDTH])
             self.assertEqual(render["verification"]["size"], [HEIGHT, WIDTH])
@@ -257,7 +258,8 @@ class VideoSmokeTest(unittest.TestCase):
             report = json.loads(run_script(
                 "replace_text.py", "render", source, delivery, *options, "--title-overlay", title,
             ))
-            self.assertEqual(report["verification"]["size"], [width, height])
+            self.assertEqual(report["source_size"], [width, height])
+            self.assertEqual(report["verification"]["size"], [1920, 1080])
             self.assertEqual(report["verification"]["fps"], "12")
             self.assertTrue(report["verification"]["decoded"])
             def audio_hash(path):
@@ -301,6 +303,28 @@ class VideoSmokeTest(unittest.TestCase):
             )
             self.assertIn(b"needs a video stream with alpha", rejected.stderr)
             self.assertFalse((work / "rejected.mkv").exists())
+
+    def test_mp4_resolution_defaults_to_full_hd_and_supports_4k(self):
+        with TemporaryDirectory(prefix="exovance-resolution-") as directory:
+            work = Path(directory)
+            source = work / "source.mp4"
+            run("ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=size=1280x720:rate=30:d=0.2",
+                "-c:v", "libx264", source)
+            portrait = work / "portrait.mp4"
+            run("ffmpeg", "-v", "error", "-display_rotation:v:0", "90",
+                "-i", source, "-c", "copy", portrait)
+            for name, video, options, size in (
+                ("landscape", source, (), [1920, 1080]),
+                ("portrait", portrait, (), [1080, 1920]),
+                ("uhd", source, ("--resolution", "4k"), [3840, 2160]),
+            ):
+                with self.subTest(name=name):
+                    report = json.loads(run_script(
+                        "watermark_export.py", video, work / f"export-{name}.mp4", "--start", "0",
+                        "--position", "bottom-center", "--font", FONT, *options,
+                    ))
+                    self.assertEqual(report["verification"]["size"], size)
+                    self.assertEqual(report["verification"]["fps"], "30")
 
 
 if __name__ == "__main__":
